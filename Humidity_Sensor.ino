@@ -29,7 +29,8 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 
-#define TESTING
+//#define TESTING
+// #define TESTING_MOCK_SENSOR
 
 #include "secrets.h"
 #include "util.h"
@@ -37,12 +38,14 @@
 #include <NTPClient.h>
 #include <TimeLib.h>
 #include "googleLogging.h"
-#include "logarthmicStats.h"
+#include "simpleStats.h"
+#include "fifo_queue.h"
 
-#define SCRIPT_VERSION "0.1"
+#define SCRIPT_VERSION "0.2"
 #define DEVICE_NAME "Hornet"
 
-const float SAMPLES_PER_HOUR = 60. * 60;
+const float UPLOADS_PER_HOUR = 1;
+const float SAMPLES_PER_HOUR = UPLOADS_PER_HOUR * SIMPLE_STATS_BUFFER_SIZE;
 unsigned long constexpr MS_BETWEEN_SAMPLES = 1000 * 60. * 60. / SAMPLES_PER_HOUR;
 
 #define ONE_WIRE_BUS 2
@@ -62,13 +65,26 @@ const unsigned long timeOffset = -8 * 60 * 60;  // time zone offset
 
 WiFiClientSecure client;
 
-GoogleLogging glog;
 
 unsigned long nextUpdateTime = 0;
 uint32_t totalBadSamples = 0;
 uint32_t totalGoodSamples = 0;
 
-LogStatsTracker tracker;
+// Define a fifo queue for 
+struct SummaryToSend
+{
+  SampleType mean_sample, min_sample, max_sample;
+  uint16_t bad_samples;
+  time_t time_stamp;
+};
+
+#define SEND_QUEUE_LENGTH 72
+FifoQueue<SummaryToSend, SEND_QUEUE_LENGTH> sendQueue;
+
+
+void bufferFull(SampleType const &mean_sample, SampleType const &min_sample, SampleType const &max_sample, const uint16_t& bad_samples);
+
+SimpleStats tracker(bufferFull);
 
 void setup(void) 
 {  
@@ -92,8 +108,31 @@ void setup(void)
     Serial.println("Wifi init.");
     while (WiFi.status() != WL_CONNECTED)
     {
-      delay(500);
-      Serial.print(".");
+      for (uint8_t retry = 0; retry < 40 && WiFi.status() != WL_CONNECTED; ++retry)
+      {
+        delay(500);
+        Serial.print(".");
+      }
+      if (WiFi.status() != WL_CONNECTED)
+      {
+        WiFi.begin(ssid2, password2);
+        Serial.println("Wifi init, key 2.");
+        for (uint8_t retry = 0; retry < 40 && WiFi.status() != WL_CONNECTED; ++retry)
+        {
+          delay(500);
+          Serial.print(".");
+        }
+        if (WiFi.status() != WL_CONNECTED)
+        {
+          WiFi.begin(ssid3, password3);
+          Serial.println("Wifi init, key 3.");
+          for (uint8_t retry = 0; retry < 40 && WiFi.status() != WL_CONNECTED; ++retry)
+          {
+            delay(500);
+            Serial.print(".");
+          }
+        }
+      }
     }
     WiFi.setAutoReconnect(true);
     WiFi.setAutoConnect(true);
@@ -107,23 +146,15 @@ void setup(void)
     Serial.println(WiFi.localIP());
     delay(2000);
 
-    glog.setup();
-
-    // init the stats trackers
-    /*for(uint8_t i = 0; i < NUMBER_OF_STAT_LAYERS - 1; ++i)
-    {
-      trackers[i].next = &trackers[i+1];
-      trackers[i+1].prev = &trackers[i];
-      trackers[i].layer = i;
-    }*/
-    tracker.push_stats = true;
-
-    nextUpdateTime = millis();
+    nextUpdateTime = millis() + MS_BETWEEN_SAMPLES;
+    
+    //SampleType test{99, 100};
+    //bufferFull(test, test, test, 3);
   }
 
 bool getSensorValues(float & tempOut, float & humidityOut)
 {
-#ifdef TESTING
+#ifdef TESTING_MOCK_SENSOR
   static uint32_t inc = 0;
   tempOut = inc;
   humidityOut = inc+10;
@@ -136,41 +167,72 @@ bool getSensorValues(float & tempOut, float & humidityOut)
 
   bool success = shtc3.getEvent(&humidity, &temp); // populate temp and humidity objects with fresh data
 
-  tempOut = temp.temperature;
+  tempOut = temp.temperature * 9.0 / 5.0 + 32.0;
   humidityOut = humidity.relative_humidity;
   return success;
 }
 
-void pushStats(SampleType const & mean_sample, SampleType const & min_sample, SampleType const & max_sample, time_t epoch, uint16_t bad_samples)
+void bufferFull(SampleType const & mean_sample, SampleType const & min_sample, SampleType const & max_sample, const uint16_t& bad_samples)
 {
-  Serial.println("PushStats");
-  String arguments = String("name=") + DEVICE_NAME + "date=" + StrTime(epoch) + "&badValues=" + String(bad_samples);
-  arguments += "minTemp" + String(min_sample.temp) + "&meanTemp=" + String(mean_sample.temp) + "&maxTemp=" + String(max_sample.temp);
-  arguments += "minHumidity" + String(min_sample.humidity) + "&meanHumidity=" + String(mean_sample.humidity) + "&maxHumidity=" + String(max_sample.humidity);
-  //glog.postData(arguments);
+
+  time_t epoch = timeClient.getEpochTime() + timeOffset;
+  SummaryToSend summary;
+  summary.time_stamp = epoch;
+  summary.mean_sample = mean_sample;
+  summary.min_sample = min_sample;
+  summary.max_sample = max_sample;
+  summary.bad_samples = bad_samples;
+  sendQueue.Push(summary);
+}
+
+void pushStats()
+{
+  SummaryToSend summary;
+  if (sendQueue.Peek(summary))
+  {
+    Serial.println("Sending stats");
+    String arguments = String("name=") + DEVICE_NAME + "&date=" + StrTime(summary.time_stamp, true) + "&badValues=" + String(summary.bad_samples);
+    arguments += "&minTemp=" + String(summary.min_sample.temp) + "&meanTemp=" + String(summary.mean_sample.temp) + "&maxTemp=" + String(summary.max_sample.temp);
+    arguments += "&minHumidity=" + String(summary.min_sample.humidity) + "&meanHumidity=" + String(summary.mean_sample.humidity) + "&maxHumidity=" + String(summary.max_sample.humidity);
+
+    Serial.println(arguments);
+
+    GoogleLogging glog;
+    glog.setup();
+    if (glog.postData(arguments))
+    {
+      sendQueue.Pop(summary);
+      Serial.println("Post successful");
+    }
+    else
+    {
+      Serial.println("Post failed");
+    }
+  }
 }
 
 void loop(void) 
 { 
   // catch clock rollover
-  if (millis() < nextUpdateTime && nextUpdateTime - millis() > MS_BETWEEN_SAMPLES * 10)
   {
-    //telegram.update();
-    delay(1000);
-    return;
+    unsigned long curTime = millis();
+    if (curTime < nextUpdateTime && nextUpdateTime - curTime > MS_BETWEEN_SAMPLES * 10)
+    {
+      delay(min(nextUpdateTime - curTime, MS_BETWEEN_SAMPLES) / 8);
+      return;
+    }
   }
 
-  timeClient.update();
-  time_t time = timeClient.getEpochTime();
+   timeClient.update();
 
-  float temp = 0, humidity = -1;
-  bool success = getSensorValues(temp, humidity);
+   float temp = 0, humidity = -1;
+   bool success = getSensorValues(temp, humidity);
   if (success)
   {
     totalGoodSamples++;
   
     // update the logarthmic stats tracker
-    tracker.Log({temp, humidity}, time);
+    tracker.Log({temp, humidity});
 
     // temp: print trackers
     Serial.print("Read: ");
@@ -182,16 +244,22 @@ void loop(void)
     Serial.print(" Bad: ");
     Serial.println(totalBadSamples);
 
-    tracker.PrintOut();
+    //tracker.PrintOut();
     Serial.println();
   }
   else
   {
-    tracker.LogBadSamples(1);
+    tracker.LogBadSample();
     totalBadSamples++;
     Serial.println("Bad sample");
   }
 
-  
+  pushStats();
+
+  if (nextUpdateTime + MS_BETWEEN_SAMPLES < millis())
+  {
+     nextUpdateTime = millis();
+     Serial.println("Next update time already reached; resetting");
+  }
   nextUpdateTime = nextUpdateTime + MS_BETWEEN_SAMPLES;
 } 

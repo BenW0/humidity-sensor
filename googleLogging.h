@@ -74,15 +74,21 @@ public:
   }
 
   // This is the main method where data gets pushed to the Google sheet
-  void postData(String arguments)
+  // Returns true if the request was successful
+  bool postData(String arguments)
   {
     if (!client.connected())
     {
       Serial.println("Connecting to client again…");
       client.connect(host, httpsPort);
+      if (!client.connected())
+        return false;
     }
     String urlFinal = url + arguments;
-    client.GET(urlFinal, host, googleRedirHost);
+    Serial.println("Calling Get to : ");
+    Serial.print(host);
+    Serial.println(urlFinal);
+    return client.GET(urlFinal, host, true);
   }
 
 };
