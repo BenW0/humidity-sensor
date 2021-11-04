@@ -42,7 +42,7 @@
 #include "fifo_queue.h"
 
 #define SCRIPT_VERSION "0.2"
-#define DEVICE_NAME "Hornet"
+#define DEVICE_NAME "Blackbird"
 
 const float UPLOADS_PER_HOUR = 1;
 const float SAMPLES_PER_HOUR = UPLOADS_PER_HOUR * SIMPLE_STATS_BUFFER_SIZE;
